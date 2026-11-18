@@ -1,0 +1,15 @@
+@import "tailwindcss";
+@source "../index.html";
+@source "./main.js";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", monospace;
+}
+
+@keyframes dash { to { stroke-dashoffset: -24; } }
+.edge-active { stroke-dasharray: 6 6; animation: dash 0.8s linear infinite; }
+.grid-bg {
+  background-image: radial-gradient(rgb(148 163 184 / 0.15) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
