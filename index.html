@@ -3,8 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ERD Simulator</title>
+  <title>ERD Simulator 3D</title>
   <link rel="stylesheet" href="./dist/output.css" />
+  <!-- Three.js (pinned) from the same CDN as Motion, so there is still no bundler -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
 </head>
 <body class="h-screen overflow-hidden bg-slate-950 font-sans text-slate-100 antialiased">
   <div class="h-full">
@@ -12,21 +21,13 @@
       <header class="pointer-events-none absolute left-4 top-4 z-10 flex flex-col gap-2">
         <div class="pointer-events-auto rounded-xl border border-slate-800 bg-slate-900/90 px-4 py-3 backdrop-blur">
           <h1 class="text-sm font-semibold tracking-wide">Electronics Store ERD</h1>
-          <p class="text-xs text-slate-400">Drag tables · click one to trace its relationships</p>
+          <p class="text-xs text-slate-400">Drag the background to orbit · scroll to zoom · drag a table to move it · click one to trace its relationships</p>
         </div>
         <div id="legend" class="pointer-events-auto flex flex-wrap gap-2"></div>
       </header>
 
-      <div id="viewport" class="grid-bg h-full overflow-auto">
-        <div id="sizer" class="relative">
-          <div id="canvas" class="absolute left-0 top-0 origin-top-left transition-transform duration-500" style="width:1260px;height:1080px">
-            <svg id="edges" class="pointer-events-none absolute inset-0" width="1260" height="1080">
-              <g id="paths"></g><g id="labels"></g><g id="packets"></g>
-            </svg>
-            <div id="cards"></div>
-          </div>
-        </div>
-      </div>
+      <!-- Three.js mounts its canvas here -->
+      <div id="viewport" class="h-full w-full overflow-hidden" style="background:radial-gradient(ellipse at 50% 38%,#10203a 0%,#07101f 55%,#020617 100%)"></div>
 
       <div class="absolute bottom-4 left-4 z-10 flex items-center gap-1 rounded-xl border border-slate-700/70 bg-slate-900/90 p-1 text-xs backdrop-blur">
         <button id="zout" class="size-8 rounded-lg text-base hover:bg-slate-800" title="Zoom out">−</button>
