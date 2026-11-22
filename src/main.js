@@ -1,6 +1,8 @@
 import { animate, stagger } from "https://cdn.jsdelivr.net/npm/motion@11.18.2/+esm";
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
-const W = 220, H0 = 34, R = 24;
+const W = 220, H0 = 34, R = 24, DEPTH = 8;
 const DOM = {
   catalog: { label: "Catalog", color: "#a78bfa" },
   procurement: { label: "Procurement", color: "#fbbf24" },
@@ -28,12 +30,14 @@ const T = {
   jobs: { d: "people", x: 980, y: 800, c: ["job_id pk", "job_name"] },
 };
 
-const NS = "http://www.w3.org/2000/svg";
+// Each business domain lives on its own depth layer. This is what turns the flat ERD into a 3D scene.
+const LAYER = { catalog: 0, procurement: -300, sales: 200, people: -60 };
+
 const $ = (s) => document.querySelector(s);
 const S = { sel: null, sim: null, hidden: new Set() };
 const edges = [];
-let Z = 1, auto = true, erdFS = false;
-let view = { ox: 0, oy: 0 };
+let Z = 1, auto = true, erdFS = false, fitDist = 2000, rm = 0, edgeEnter = 0;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 for (const [n, t] of Object.entries(T)) {
   t.cols = t.c.map((s) => { const [name, k, ref] = s.split(" "); return { name, k, ref }; });
@@ -44,50 +48,196 @@ for (const [n, t] of Object.entries(T)) {
 const pkIndex = (n) => Math.max(0, T[n].cols.findIndex((c) => c.k === "pk"));
 edges.forEach((e) => (e.pi = pkIndex(e.parent)));
 
-// ---------- build cards ----------
-for (const [n, t] of Object.entries(T)) {
-  const col = DOM[t.d].color;
-  const el = document.createElement("div");
-  el.className = "card absolute w-[220px] select-none rounded-xl border bg-slate-900 shadow-lg shadow-black/50 transition-[opacity,box-shadow] duration-300";
-  el.style.cssText = `left:${t.x}px;top:${t.y}px;border-color:${col}55`;
-  el.innerHTML =
-    `<div data-h class="flex h-[34px] cursor-grab items-center gap-2 rounded-t-xl px-3 text-sm font-semibold active:cursor-grabbing" style="background:${col}22;color:${col}"><span class="size-2 rounded-full" style="background:${col}"></span>${n}</div>` +
-    t.cols.map((c) => {
-      const b = c.k === "pk" ? `<span class="rounded bg-amber-400/20 px-1 text-[10px] font-bold text-amber-300">PK</span>`
-        : c.k === "fk" ? `<span class="rounded bg-cyan-400/20 px-1 text-[10px] font-bold text-cyan-300">FK</span>` : "";
-      return `<div class="flex h-6 items-center justify-between px-3 font-mono text-xs ${c.k === "pk" ? "text-amber-100" : "text-slate-300"}"><span>${c.name}</span>${b}</div>`;
-    }).join("");
-  t.el = el;
-  $("#cards").append(el);
-  el.addEventListener("pointerdown", (ev) => startDrag(ev, n));
+// ---------- 3D layout: world position of every table ----------
+const tl = Object.values(T);
+for (const t of tl) t.h = H0 + t.cols.length * R;
+const cx0 = (Math.min(...tl.map((t) => t.x)) + Math.max(...tl.map((t) => t.x + W))) / 2;
+const cy0 = (Math.min(...tl.map((t) => t.y)) + Math.max(...tl.map((t) => t.y + t.h))) / 2;
+const seen = {};
+for (const t of tl) {
+  const k = (seen[t.d] = (seen[t.d] ?? -1) + 1);
+  t.p = new THREE.Vector3(t.x + W / 2 - cx0, -(t.y + t.h / 2 - cy0), LAYER[t.d] + ((k % 3) - 1) * 35);
+  Object.assign(t, { enter: 0, cur: 1, tgt: 1, hcur: 0, htgt: 0, pulse: 1, eff: 0 });
+}
+const floorY = Math.min(...tl.map((t) => t.p.y - t.h / 2)) - 150;
+
+// ---------- renderer, camera, controls ----------
+const vp = $("#viewport");
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const cv = renderer.domElement;
+cv.style.display = "block";
+vp.append(cv);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x020617, 2600, 6000);
+const camera = new THREE.PerspectiveCamera(38, 1, 10, 12000);
+camera.position.set(0, 0, 2000);
+const controls = new OrbitControls(camera, cv);
+Object.assign(controls, {
+  enableDamping: true, dampingFactor: 0.08, screenSpacePanning: true,
+  minDistance: 200, maxDistance: 6000,
+  minAzimuthAngle: -1.3, maxAzimuthAngle: 1.3,   // cards are one-sided, so don't orbit behind them
+  minPolarAngle: 0.35, maxPolarAngle: 1.75,
+});
+const DIR = new THREE.Vector3(0.42, 0.26, 1).normalize();   // default 3/4 viewing direction
+
+// ---------- floor, domain plates, dust ----------
+const grid = new THREE.GridHelper(5000, 100, 0x1e3a5f, 0x16233a);
+grid.position.y = floorY;
+grid.material.transparent = true; grid.material.opacity = 0.6;
+scene.add(grid);
+
+const plates = {};
+for (const [k, v] of Object.entries(DOM)) {
+  const ts = tl.filter((t) => t.d === k);
+  const x0 = Math.min(...ts.map((t) => t.p.x - W / 2)) - 40, x1 = Math.max(...ts.map((t) => t.p.x + W / 2)) + 40;
+  const z0 = Math.min(...ts.map((t) => t.p.z)) - 90, z1 = Math.max(...ts.map((t) => t.p.z)) + 90;
+  const plate = new THREE.Mesh(
+    new THREE.PlaneGeometry(x1 - x0, z1 - z0),
+    new THREE.MeshBasicMaterial({ color: v.color, transparent: true, opacity: 0.08, depthWrite: false, side: THREE.DoubleSide }),
+  );
+  plate.rotation.x = -Math.PI / 2;
+  plate.position.set((x0 + x1) / 2, floorY + 1, (z0 + z1) / 2);
+  scene.add(plate);
+  plates[k] = plate;
 }
 
-// ---------- edges ----------
+const dust = new Float32Array(600 * 3);
+for (let i = 0; i < dust.length; i += 3) {
+  dust[i] = (Math.random() - 0.5) * 3600; dust[i + 1] = floorY + Math.random() * 2200; dust[i + 2] = (Math.random() - 0.5) * 2400;
+}
+const dustGeo = new THREE.BufferGeometry();
+dustGeo.setAttribute("position", new THREE.BufferAttribute(dust, 3));
+scene.add(new THREE.Points(dustGeo, new THREE.PointsMaterial({ color: 0x64748b, size: 3, transparent: true, opacity: 0.45, depthWrite: false })));
+
+// ---------- textures ----------
+const SANS = 'Inter, ui-sans-serif, system-ui, "Segoe UI", sans-serif';
+const MONO = '"JetBrains Mono", ui-monospace, Consolas, Menlo, monospace';
+const aniso = renderer.capabilities.getMaxAnisotropy();
+function tex(canvas) {
+  const t = new THREE.CanvasTexture(canvas);
+  t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = aniso;
+  return t;
+}
+function cardTexture(n, t) {
+  const col = DOM[t.d].color, k = 3;
+  const c = document.createElement("canvas");
+  c.width = W * k; c.height = t.h * k;
+  const g = c.getContext("2d");
+  g.scale(k, k);
+  g.fillStyle = "#0f172a"; g.fillRect(0, 0, W, t.h);
+  g.fillStyle = col + "22"; g.fillRect(0, 0, W, H0);
+  g.textBaseline = "middle";
+  g.fillStyle = col; g.beginPath(); g.arc(16, H0 / 2, 4, 0, Math.PI * 2); g.fill();
+  g.font = `600 14px ${SANS}`; g.fillText(n, 28, H0 / 2 + 1);
+  t.cols.forEach((col2, i) => {
+    const y = H0 + i * R + R / 2;
+    g.font = `12px ${MONO}`; g.fillStyle = col2.k === "pk" ? "#fef3c7" : "#cbd5e1";
+    g.fillText(col2.name, 12, y + 1);
+    if (col2.k) {
+      const pk = col2.k === "pk", bw = 22, bx = W - 12 - bw;
+      g.fillStyle = pk ? "rgba(251,191,36,.2)" : "rgba(34,211,238,.2)";
+      g.beginPath(); g.roundRect(bx, y - 7, bw, 14, 3); g.fill();
+      g.font = `700 10px ${SANS}`; g.fillStyle = pk ? "#fcd34d" : "#67e8f9"; g.textAlign = "center";
+      g.fillText(pk ? "PK" : "FK", bx + bw / 2, y + 1); g.textAlign = "left";
+    }
+  });
+  g.strokeStyle = col + "88"; g.lineWidth = 2; g.strokeRect(1, 1, W - 2, t.h - 2);
+  return tex(c);
+}
+function haloTexture(t) {
+  const col = DOM[t.d].color, P = 30, k = 2;
+  const c = document.createElement("canvas");
+  c.width = (W + P * 2) * k; c.height = (t.h + P * 2) * k;
+  const g = c.getContext("2d");
+  g.shadowColor = col; g.shadowBlur = 40; g.fillStyle = col;
+  g.fillRect(P * k, P * k, W * k, t.h * k);
+  g.shadowBlur = 0; g.strokeStyle = col; g.lineWidth = 6;
+  g.strokeRect(P * k, P * k, W * k, t.h * k);
+  return tex(c);
+}
+function textTex(txt) {
+  const c = document.createElement("canvas");
+  c.width = c.height = 64;
+  const g = c.getContext("2d");
+  g.font = `700 40px ${SANS}`; g.fillStyle = "#94a3b8"; g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText(txt, 32, 34);
+  return tex(c);
+}
+function glowTexture() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 64;
+  const g = c.getContext("2d"), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(0.25, "rgba(255,255,255,.5)"); gr.addColorStop(1, "rgba(255,255,255,0)");
+  g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+  return tex(c);
+}
+
+// ---------- cards (thin 3D slabs with the table drawn on the front) ----------
+for (const [n, t] of Object.entries(T)) {
+  const col = DOM[t.d].color;
+  const side = new THREE.Color(col).multiplyScalar(0.3);
+  const mk = (o) => new THREE.MeshBasicMaterial({ transparent: true, ...o });
+  t.mats = [mk({ color: side }), mk({ color: side }), mk({ color: side }), mk({ color: side }), mk({ map: cardTexture(n, t) }), mk({ color: 0x0b1220 })];
+  t.mesh = new THREE.Mesh(new THREE.BoxGeometry(W, t.h, DEPTH), t.mats);
+  t.mesh.userData.n = n;
+  t.halo = new THREE.Mesh(
+    new THREE.PlaneGeometry(W + 60, t.h + 60),
+    new THREE.MeshBasicMaterial({ map: haloTexture(t), transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }),
+  );
+  t.halo.position.z = -DEPTH / 2 - 1;
+  t.mesh.add(t.halo);
+  // thin line from each card down to the floor, so depth is easy to read
+  t.drop = new THREE.Line(
+    new THREE.BufferGeometry().setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3)),
+    new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.28 }),
+  );
+  t.drop.frustumCulled = false;
+  scene.add(t.mesh, t.drop);
+  syncCard(t);
+}
+function syncCard(t) {
+  t.mesh.position.copy(t.p);
+  const a = t.drop.geometry.attributes.position;
+  a.setXYZ(0, t.p.x, t.p.y - t.h / 2, t.p.z);
+  a.setXYZ(1, t.p.x, floorY, t.p.z);
+  a.needsUpdate = true;
+}
+const meshes = tl.map((t) => t.mesh);
+
+// ---------- edges (3D tubes) ----------
+const texN = textTex("N"), tex1 = textTex("1");
+const mkLabel = (map) => {
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map, transparent: true, depthWrite: false }));
+  s.scale.set(22, 22, 1);
+  return s;
+};
 for (const e of edges) {
-  e.el = document.createElementNS(NS, "path");
-  e.el.setAttribute("fill", "none");
-  e.el.setAttribute("stroke-linecap", "round");
-  $("#paths").append(e.el);
-  for (const k of ["a", "b"]) {
-    e[k] = document.createElementNS(NS, "text");
-    e[k].setAttribute("font-size", "11");
-    e[k].setAttribute("font-weight", "700");
-    e[k].setAttribute("fill", "#94a3b8");
-    e[k].textContent = k === "a" ? "N" : "1";
-    $("#labels").append(e[k]);
-  }
+  e.mat = new THREE.MeshBasicMaterial({ color: 0x475569, transparent: true });
+  e.mesh = new THREE.Mesh(new THREE.BufferGeometry(), e.mat);
+  e.a = mkLabel(texN); e.b = mkLabel(tex1);
+  Object.assign(e, { on: false, cur: 0.9, tgt: 0.9, lcur: 1, ltgt: 1 });
+  scene.add(e.mesh, e.a, e.b);
 }
 function place(e) {
   const C = T[e.child], P = T[e.parent];
-  const cy = C.y + H0 + e.ci * R + R / 2, py = P.y + H0 + e.pi * R + R / 2;
+  const row = (t, i) => t.p.y + t.h / 2 - H0 - i * R - R / 2;
+  const cy = row(C, e.ci), py = row(P, e.pi), dx = C.p.x - P.p.x;
   let cx, px, cd, pd;
-  if (C.x > P.x) { cx = C.x; cd = -1; px = P.x + W; pd = 1; }
-  else if (C.x < P.x) { cx = C.x + W; cd = 1; px = P.x; pd = -1; }
-  else { cx = C.x + W; cd = 1; px = P.x + W; pd = 1; }
-  const k = C.x === P.x ? 60 : Math.max(40, Math.abs(cx - px) / 2);
-  e.el.setAttribute("d", `M${cx} ${cy} C${cx + cd * k} ${cy},${px + pd * k} ${py},${px} ${py}`);
-  e.a.setAttribute("x", cx + (cd > 0 ? 6 : -14)); e.a.setAttribute("y", cy - 5);
-  e.b.setAttribute("x", px + (pd > 0 ? 6 : -10)); e.b.setAttribute("y", py - 5);
+  if (dx > 4) { cx = C.p.x - W / 2; cd = -1; px = P.p.x + W / 2; pd = 1; }
+  else if (dx < -4) { cx = C.p.x + W / 2; cd = 1; px = P.p.x - W / 2; pd = -1; }
+  else { cx = C.p.x + W / 2; cd = 1; px = P.p.x + W / 2; pd = 1; }
+  const same = Math.abs(dx) <= 4;
+  const k = same ? 70 : Math.max(50, Math.hypot(cx - px, C.p.z - P.p.z) / 2);
+  e.curve = new THREE.CubicBezierCurve3(
+    new THREE.Vector3(cx, cy, C.p.z), new THREE.Vector3(cx + cd * k, cy, C.p.z),
+    new THREE.Vector3(px + pd * k, py, P.p.z), new THREE.Vector3(px, py, P.p.z),
+  );
+  e.mesh.geometry.dispose();
+  e.mesh.geometry = new THREE.TubeGeometry(e.curve, 48, e.on ? 2.4 : 1.4, 6, false);
+  e.a.position.set(cx + cd * 14, cy + 10, C.p.z);
+  e.b.position.set(px + pd * 14, py + 10, P.p.z);
 }
 
 // ---------- focus / highlight ----------
@@ -101,46 +251,109 @@ function refresh() {
   }
   for (const [n, t] of Object.entries(T)) {
     const on = focus?.t.has(n);
-    t.el.style.opacity = S.hidden.has(t.d) ? 0.12 : rv && !rv.has(n) ? 0.04 : focus && !on ? (rv ? 0.55 : 0.3) : 1;
-    t.el.style.boxShadow = on ? `0 0 0 2px ${DOM[t.d].color}, 0 0 28px ${DOM[t.d].color}55` : "";
+    t.tgt = S.hidden.has(t.d) ? 0.12 : rv && !rv.has(n) ? 0.04 : focus && !on ? (rv ? 0.55 : 0.3) : 1;
+    t.htgt = on ? 0.9 : 0;
   }
+  for (const k of Object.keys(plates)) plates[k].visible = !S.hidden.has(k);
   for (const e of edges) {
-    const on = focus?.e.has(e.id);
+    const on = !!focus?.e.has(e.id);
     const gone = rv && !(rv.has(e.child) && rv.has(e.parent));
-    e.el.setAttribute("stroke", on ? "#22d3ee" : "#475569");
-    e.el.setAttribute("stroke-width", on ? 2.5 : 1.5);
-    e.el.setAttribute("opacity", gone ? 0 : focus && !on ? 0.2 : 0.9);
-    e.el.classList.toggle("edge-active", !!on && !!S.sim);
-    e.a.setAttribute("opacity", gone ? 0 : focus && !on ? 0.2 : 1);
-    e.b.setAttribute("opacity", gone ? 0 : focus && !on ? 0.2 : 1);
+    e.mat.color.set(on ? "#22d3ee" : "#475569");
+    e.tgt = gone ? 0 : focus && !on ? 0.2 : 0.9;
+    e.ltgt = gone ? 0 : focus && !on ? 0.2 : 1;
+    if (e.on !== on) { e.on = on; place(e); }   // active edges are drawn thicker
   }
 }
 
-// ---------- dragging ----------
-function startDrag(ev, n) {
-  const t = T[n], sx = ev.clientX, sy = ev.clientY, ox = t.x, oy = t.y;
+// ---------- render loop ----------
+let last = performance.now(), lastZ = -1;
+function tick(now) {
+  requestAnimationFrame(tick);
+  const k = 1 - Math.exp(-Math.min(0.1, (now - last) / 1000) * 10);
+  last = now;
+  for (const t of tl) {
+    t.cur += (t.tgt - t.cur) * k; t.hcur += (t.htgt - t.hcur) * k;
+    t.eff = t.cur * t.enter;
+    t.mesh.visible = t.drop.visible = t.eff > 0.01;
+    for (const m of t.mats) m.opacity = t.eff;
+    t.halo.material.opacity = t.hcur * t.enter;
+    t.drop.material.opacity = 0.28 * t.eff;
+    t.mesh.scale.setScalar(t.pulse * (0.88 + 0.12 * t.enter));
+  }
+  for (const e of edges) {
+    e.cur += (e.tgt - e.cur) * k; e.lcur += (e.ltgt - e.lcur) * k;
+    e.mat.opacity = e.cur * edgeEnter;
+    e.mesh.visible = e.a.visible = e.b.visible = e.mat.opacity > 0.01;
+    e.a.material.opacity = e.b.material.opacity = e.lcur * edgeEnter;
+  }
+  controls.update();
+  renderer.render(scene, camera);
+  Z = fitDist / camera.position.distanceTo(controls.target);
+  const z = Math.round(Z * 100);
+  if (z !== lastZ) { lastZ = z; $("#zlabel").textContent = z + "%"; }
+}
+requestAnimationFrame(tick);
+
+function pulse(n, delay = 0, dur = 0.5, amt = 0.06) {
+  const t = T[n];
+  animate(0, 1, { duration: dur, delay, onUpdate: (v) => (t.pulse = 1 + amt * Math.sin(Math.PI * v)), onComplete: () => (t.pulse = 1) });
+}
+
+// ---------- picking + dragging (cards move on a plane facing the camera) ----------
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+function setRay(ev) {
+  const r = cv.getBoundingClientRect();
+  ndc.set(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+}
+function pick(ev) {
+  setRay(ev);
+  return ray.intersectObjects(meshes.filter((m) => T[m.userData.n].eff > 0.1), false)[0];
+}
+// capture phase on the parent, so we can switch orbiting off before OrbitControls sees the press
+vp.addEventListener("pointerdown", (ev) => {
+  if (ev.button !== 0) return;
+  const hit = pick(ev);
+  if (!hit) return;
+  const n = hit.object.userData.n, t = T[n];
+  controls.enabled = false;
+  cv.setPointerCapture(ev.pointerId);
+  cv.style.cursor = "grabbing";
+  const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(new THREE.Vector3()), hit.point);
+  const off = hit.point.clone().sub(t.p);
+  const sx = ev.clientX, sy = ev.clientY;
   let moved = false;
-  t.el.setPointerCapture(ev.pointerId);
   const mv = (m) => {
-    const dx = (m.clientX - sx) / Z, dy = (m.clientY - sy) / Z;
-    if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
-    if (!moved) return;
-    t.x = Math.max(0, Math.min(1040, ox + dx)); t.y = Math.max(0, Math.min(1000, oy + dy));
-    t.el.style.left = t.x + "px"; t.el.style.top = t.y + "px";
+    if (!moved && Math.hypot(m.clientX - sx, m.clientY - sy) < 4) return;
+    moved = true;
+    setRay(m);
+    const pt = new THREE.Vector3();
+    if (!ray.ray.intersectPlane(plane, pt)) return;
+    pt.sub(off);
+    t.p.set(clamp(pt.x, -900, 900), clamp(pt.y, floorY + t.h / 2 + 40, 800), clamp(pt.z, -700, 700));
+    syncCard(t);
     edges.forEach((e) => (e.child === n || e.parent === n) && place(e));
   };
   const up = () => {
-    t.el.removeEventListener("pointermove", mv); t.el.removeEventListener("pointerup", up);
+    cv.removeEventListener("pointermove", mv); cv.removeEventListener("pointerup", up); cv.removeEventListener("pointercancel", up);
+    controls.enabled = true; cv.style.cursor = "";
     if (!moved) select(n);
   };
-  t.el.addEventListener("pointermove", mv); t.el.addEventListener("pointerup", up);
-}
+  cv.addEventListener("pointermove", mv); cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
+}, true);
+cv.addEventListener("pointermove", (ev) => { if (!ev.buttons) cv.style.cursor = pick(ev) ? "pointer" : ""; });
+
+const neighbors = (n) => {
+  const s = new Set([n]);
+  edges.forEach((e) => { if (e.child === n || e.parent === n) { s.add(e.child); s.add(e.parent); } });
+  return [...s];
+};
 function select(n, scroll) {
   S.sim = null; si = -1; renderDots(); renderStep(); setTab("insp");
   S.sel = S.sel === n && !scroll ? null : n;
   refresh(); renderInsp();
-  if (scroll && !auto) T[n].el.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
-  if (S.sel) animate(T[n].el, { scale: [1, 1.04, 1] }, { duration: 0.4 });
+  if (scroll && !auto) focusStep(neighbors(n));
+  if (S.sel) pulse(n, 0, 0.4, 0.05);
 }
 
 // ---------- inspector ----------
@@ -262,42 +475,79 @@ function renderStep() {
   box.querySelector("pre").textContent = s.sql;
   animate(box, { opacity: [0, 1], y: [10, 0] }, { duration: 0.35 });
 }
-function focusStep(names) {
-  const ts = names.map((n) => T[n]);
-  const x0 = Math.min(...ts.map((t) => t.x)), x1 = Math.max(...ts.map((t) => t.x + W));
-  const y0 = Math.min(...ts.map((t) => t.y)), y1 = Math.max(...ts.map((t) => t.y + H0 + t.cols.length * R));
-  const vp = $("#viewport");
-  const rm = innerWidth < 700 || $("#panelBody").classList.contains("hidden") ? 0 : $("#panel").offsetWidth + 24;
-  auto = false;
-  Z = Math.max(0.5, Math.min(1.1, (vp.clientWidth - rm - 120) / (x1 - x0), (vp.clientHeight - 200) / (y1 - y0)));
-  layout();
-  vp.scrollTo({
-    left: view.ox + ((x0 + x1) / 2) * Z - (vp.clientWidth - rm) / 2,
-    top: view.oy + ((y0 + y1) / 2) * Z - vp.clientHeight / 2,
-    behavior: "smooth",
+
+// ---------- camera: fit + fly ----------
+const corners = (t) => {
+  const out = [];
+  for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1])
+    out.push(new THREE.Vector3(t.p.x + (sx * W) / 2, t.p.y + (sy * t.h) / 2, t.p.z + (sz * DEPTH) / 2));
+  return out;
+};
+// how far the camera must sit, looking along dir, for these tables to fill the free part of the screen
+function distFor(names, dir, padX, padY) {
+  const w = vp.clientWidth, h = vp.clientHeight;
+  const uw = Math.max(200, w - rm - padX), uh = Math.max(200, h - padY);
+  const th = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  const tx = (th * uw) / h, ty = (th * uh) / h;
+  const pts = names.flatMap((n) => corners(T[n]));
+  const c = new THREE.Box3().setFromPoints(pts).getCenter(new THREE.Vector3());
+  const f = dir.clone().normalize(), right = new THREE.Vector3(0, 1, 0).cross(f).normalize(), up = f.clone().cross(right);
+  let D = 0;
+  for (const p of pts) {
+    const r = p.clone().sub(c), z = r.dot(f);
+    D = Math.max(D, Math.abs(r.dot(right)) / tx + z, Math.abs(r.dot(up)) / ty + z);
+  }
+  return { c, D };
+}
+let fly;
+function flyTo(pos, tgt, dur = 0.9) {
+  fly?.stop();
+  if (!dur) { camera.position.copy(pos); controls.target.copy(tgt); controls.update(); return; }
+  const p0 = camera.position.clone(), t0 = controls.target.clone();
+  fly = animate(0, 1, {
+    duration: dur, ease: "easeInOut",
+    onUpdate: (v) => { camera.position.lerpVectors(p0, pos, v); controls.target.lerpVectors(t0, tgt, v); },
   });
 }
+function fitAll(animated) {
+  const { c, D } = distFor(Object.keys(T), DIR, 80, innerWidth < 700 ? 300 : 230);
+  fitDist = D;
+  flyTo(c.clone().addScaledVector(DIR, D), c, animated ? 1.1 : 0);
+}
+function focusStep(names) {
+  auto = false;
+  const dir = camera.position.clone().sub(controls.target).normalize();   // keep the current viewing angle
+  const { c, D } = distFor(names, dir, 120, 200);
+  flyTo(c.clone().addScaledVector(dir, Math.max(D, 620)), c, 1);
+}
+controls.addEventListener("start", () => { auto = false; fly?.stop(); });
+
 function go(i) {
   si = Math.max(0, Math.min(i, steps().length - 1));
   const s = steps()[si];
   S.sel = null; S.sim = { t: new Set(s.t), e: new Set(s.e), reveal: s.reveal ? new Set(s.reveal) : null };
   setTab("sim"); renderDots(); renderStep(); refresh(); renderInsp();
-  animate(s.t.map((n) => T[n].el), { scale: [1, 1.05, 1] }, { duration: 0.6, delay: stagger(0.08) });
-  if (s.fit) { auto = true; layout(); } else focusStep(s.t);
+  s.t.forEach((n, k) => pulse(n, k * 0.08, 0.6, 0.07));
+  if (s.fit) { auto = true; layout(true); } else focusStep(s.t);
   s.e.forEach((id) => packet(edges.find((e) => e.id === id)));
 }
+const packetGeo = new THREE.SphereGeometry(6, 16, 12);
+const packetMat = new THREE.MeshBasicMaterial({ color: 0x22d3ee });
+const glowMat = new THREE.SpriteMaterial({ map: glowTexture(), color: 0x22d3ee, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false });
 function packet(e) {
-  const len = e.el.getTotalLength();
-  const dot = document.createElementNS(NS, "circle");
-  dot.setAttribute("r", 6); dot.setAttribute("fill", "#22d3ee");
-  dot.setAttribute("style", "filter:drop-shadow(0 0 6px #22d3ee)");
-  $("#packets").append(dot);
-  animate(0, 1, { duration: 1.2, ease: "easeInOut", onUpdate: (v) => {
-    const p = e.el.getPointAtLength((1 - v) * len);  // path is child→parent; packet flows parent→child (the key travels down)
-    dot.setAttribute("cx", p.x); dot.setAttribute("cy", p.y);
-  }, onComplete: () => dot.remove() });
+  const dot = new THREE.Mesh(packetGeo, packetMat);
+  const glow = new THREE.Sprite(glowMat);
+  glow.scale.setScalar(46);
+  dot.add(glow);
+  scene.add(dot);
+  animate(0, 1, {
+    duration: 1.2, ease: "easeInOut",
+    onUpdate: (v) => dot.position.copy(e.curve.getPointAt(1 - v)),   // curve is child→parent; the key travels parent→child
+    onComplete: () => scene.remove(dot),
+  });
 }
-function reset() { si = -1; S.sim = null; auto = true; layout(); renderDots(); renderStep(); refresh(); renderInsp(); }
+function reset() { si = -1; S.sim = null; auto = true; layout(true); renderDots(); renderStep(); refresh(); renderInsp(); }
+
 function advance() {
   if (si < steps().length - 1) return go(si + 1);
   sc = (sc + 1) % SC.length; styleScen(); go(0);          // roll into the next section
@@ -350,37 +600,39 @@ document.addEventListener("fullscreenchange", () => {
 });
 
 // ---------- zoom / fit ----------
-function layout() {
-  const vp = $("#viewport"), vw = vp.clientWidth, vh = vp.clientHeight;
-  const narrow = innerWidth < 700;
-  const rm = narrow || $("#panelBody").classList.contains("hidden") ? 0 : $("#panel").offsetWidth + 24;
-  // equal margins on both sides so the ERD sits dead-center; the right margin also clears the panel
-  const mx = Math.max(24, rm), my = narrow ? 150 : 110;
-  // measure the real extent of the tables, not the whole canvas
-  const ts = Object.values(T);
-  const bx0 = Math.min(...ts.map((t) => t.x)), bx1 = Math.max(...ts.map((t) => t.x + W));
-  const by0 = Math.min(...ts.map((t) => t.y)), by1 = Math.max(...ts.map((t) => t.y + H0 + t.cols.length * R));
-  const cw = bx1 - bx0, ch = by1 - by0;
-  if (auto) Z = Math.max(0.3, Math.min(1.6, (vw - 2 * mx) / cw, (vh - 2 * my) / ch));
-  const sw = Math.max(vw, cw * Z + 2 * mx), sh = Math.max(vh, ch * Z + 2 * my);
-  const ox = (sw - cw * Z) / 2 - bx0 * Z, oy = (sh - ch * Z) / 2 - by0 * Z;
-  view = { ox, oy };
-  $("#canvas").style.transform = `translate(${ox}px,${oy}px) scale(${Z})`;
-  $("#sizer").style.width = sw + "px";
-  $("#sizer").style.height = sh + "px";
-  $("#zlabel").textContent = Math.round(Z * 100) + "%";
+let lw = 0, lh = 0;
+function layout(animated = false) {
+  const w = vp.clientWidth, h = vp.clientHeight;
+  if (!w || !h) return;
+  lw = w; lh = h;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  rm = innerWidth < 700 || $("#panelBody").classList.contains("hidden") ? 0 : $("#panel").offsetWidth + 24;
+  camera.setViewOffset(w, h, rm / 2, 0, w, h);   // slide the scene left so it centres in the space the panel leaves free
+  if (auto) fitAll(animated);
 }
-const zoom = (d) => { auto = false; Z = Math.max(0.3, Math.min(2.2, Z + d)); layout(); };
-$("#zin").onclick = () => zoom(0.15);
-$("#zout").onclick = () => zoom(-0.15);
-$("#zfit").onclick = () => { auto = true; layout(); };
-$("#viewport").addEventListener("wheel", (e) => { if (e.ctrlKey) { e.preventDefault(); zoom(e.deltaY < 0 ? 0.1 : -0.1); } }, { passive: false });
-addEventListener("resize", layout);
+const zoomBy = (f) => {
+  auto = false;
+  const d = camera.position.clone().sub(controls.target).multiplyScalar(f);
+  flyTo(controls.target.clone().add(d), controls.target.clone(), 0.25);
+};
+$("#zin").onclick = () => zoomBy(1 / 1.25);
+$("#zout").onclick = () => zoomBy(1.25);
+$("#zfit").onclick = () => { auto = true; layout(true); };
+new ResizeObserver(() => { if (vp.clientWidth !== lw || vp.clientHeight !== lh) layout(); }).observe(vp);
 
 // ---------- init ----------
 edges.forEach(place);
 layout();
+{ // opening swoop: start off to the side and further back, then glide into the fitted view
+  const p = camera.position.clone(), t = controls.target.clone();
+  const off = p.clone().sub(t).applyAxisAngle(new THREE.Vector3(0, 1, 0), -0.6).multiplyScalar(1.35);
+  off.y += 200;
+  camera.position.copy(t).add(off);
+  controls.update();
+  flyTo(p, t, 1.8);
+}
 setTab("sim"); styleScen(); renderDots(); renderStep(); renderInsp(); refresh();
 animate("#panel", { opacity: [0, 1], x: [24, 0] }, { duration: 0.5, delay: 0.3 });
-animate(".card", { opacity: [0, 1], y: [24, 0] }, { delay: stagger(0.05), duration: 0.5 }).then(refresh);
-animate("#edges", { opacity: [0, 1] }, { delay: 0.5, duration: 0.8 });
+tl.forEach((t, i) => animate(0, 1, { delay: i * 0.05, duration: 0.6, ease: "easeOut", onUpdate: (v) => (t.enter = v) }));
+animate(0, 1, { delay: 0.5, duration: 0.8, onUpdate: (v) => (edgeEnter = v) });
